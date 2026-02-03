@@ -3,6 +3,7 @@
 from fastmcp import FastMCP
 from pydantic import Field
 from azure.identity import DefaultAzureCredential
+from starlette.middleware import Middleware
 import logging
 
 from powerbi_client import PowerBIClient
@@ -15,6 +16,22 @@ mcp = FastMCP(name="Power BI MCP Server")
 
 # Initialize Power BI client
 _client = None
+
+
+class RequestIPLogger:
+    """ASGI middleware to log client IPs for HTTP requests."""
+
+    def __init__(self, app, logger: logging.Logger):
+        self._app = app
+        self._logger = logger
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            client = scope.get("client") or ("unknown", 0)
+            method = scope.get("method", "?")
+            path = scope.get("path", "?")
+            self._logger.info("HTTP %s %s from %s:%s", method, path, client[0], client[1])
+        await self._app(scope, receive, send)
 
 
 def get_client() -> PowerBIClient:
@@ -118,4 +135,9 @@ TOPN({max_rows}, FILTER('{table_name}', CONTAINSSTRING('{table_name}'[{column_na
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", port=8000)
+    mcp.run(
+        transport="streamable-http",
+        host="127.0.0.1",
+        port=8000,
+        middleware=[Middleware(RequestIPLogger, logger=logger)],
+    )
