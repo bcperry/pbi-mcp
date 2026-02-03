@@ -55,6 +55,28 @@ except Exception as e:
 _pbi_client = PowerBIClient(_credential)
 logger.info("Power BI client initialized")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Discover workspace and dataset at startup
+# ─────────────────────────────────────────────────────────────────────────────
+logger.info("Discovering workspace and dataset...")
+_workspaces_df = _pbi_client.list_workspaces()
+if _workspaces_df.empty:
+    raise RuntimeError("No workspaces found")
+WORKSPACE_NAME = _workspaces_df.iloc[0]["name"]
+logger.info(f"Using workspace: {WORKSPACE_NAME}")
+
+_datasets_df = _pbi_client.list_datasets(WORKSPACE_NAME)
+if _datasets_df.empty:
+    raise RuntimeError(f"No datasets found in workspace '{WORKSPACE_NAME}'")
+DATASET_NAME = _datasets_df.iloc[0]["name"]
+logger.info(f"Using dataset: {DATASET_NAME}")
+
+# Load schema once at startup
+logger.info("Loading dataset schema...")
+_schema = _pbi_client.describe_dataset(WORKSPACE_NAME, DATASET_NAME)
+DATASET_SCHEMA = _schema["llm_context"]
+logger.info(f"Schema loaded: {len(_schema.get('tables', []))} tables")
+
 # Initialize FastAPI
 app = FastAPI(title="Power BI Agent API")
 
@@ -72,54 +94,12 @@ app.add_middleware(
 # Tool Functions - These will be available to the agent
 # ─────────────────────────────────────────────────────────────────────────────
 
-def list_workspaces() -> str:
-    """List all Power BI workspaces the user has access to."""
-    logger.info("TOOL CALLED: list_workspaces()")
-    try:
-        df = _pbi_client.list_workspaces()
-        logger.info(f"list_workspaces returned {len(df)} workspaces")
-        result = df[["name", "id"]].to_string(index=False)
-        logger.debug(f"Result: {result[:200]}...")
-        return result
-    except Exception as e:
-        logger.error(f"list_workspaces FAILED: {e}")
-        logger.error(traceback.format_exc())
-        return f"Error listing workspaces: {str(e)}"
-
-
-def list_datasets(workspace_name: str) -> str:
-    """List all datasets in a Power BI workspace."""
-    logger.info(f"TOOL CALLED: list_datasets(workspace_name='{workspace_name}')")
-    try:
-        df = _pbi_client.list_datasets(workspace_name)
-        logger.info(f"list_datasets returned {len(df)} datasets")
-        result = df[["name", "id"]].to_string(index=False)
-        return result
-    except Exception as e:
-        logger.error(f"list_datasets FAILED: {e}")
-        logger.error(traceback.format_exc())
-        return f"Error listing datasets: {str(e)}"
-
-
-def describe_dataset(workspace_name: str, dataset_name: str) -> str:
-    """Get the schema of a Power BI semantic model including tables, columns, and relationships."""
-    logger.info(f"TOOL CALLED: describe_dataset(workspace='{workspace_name}', dataset='{dataset_name}')")
-    try:
-        schema = _pbi_client.describe_dataset(workspace_name, dataset_name)
-        logger.info(f"describe_dataset returned schema with {len(schema.get('tables', []))} tables")
-        return schema["llm_context"]
-    except Exception as e:
-        logger.error(f"describe_dataset FAILED: {e}")
-        logger.error(traceback.format_exc())
-        return f"Error describing dataset: {str(e)}"
-
-
-def execute_dax(workspace_name: str, dataset_name: str, dax_query: str) -> str:
-    """Execute a DAX query against a Power BI semantic model and return results."""
-    logger.info(f"TOOL CALLED: execute_dax(workspace='{workspace_name}', dataset='{dataset_name}')")
+def execute_dax(dax_query: str) -> str:
+    """Execute a DAX query against the semantic model and return results."""
+    logger.info(f"TOOL CALLED: execute_dax()")
     logger.debug(f"DAX Query: {dax_query}")
     try:
-        df = _pbi_client.execute_dax(workspace_name, dataset_name, dax_query)
+        df = _pbi_client.execute_dax(WORKSPACE_NAME, DATASET_NAME, dax_query)
         if df.empty:
             logger.info("execute_dax returned no results")
             return "Query returned no results."
@@ -129,6 +109,60 @@ def execute_dax(workspace_name: str, dataset_name: str, dax_query: str) -> str:
         logger.error(f"execute_dax FAILED: {e}")
         logger.error(traceback.format_exc())
         return f"Error executing DAX: {str(e)}"
+
+
+def get_table_sample(table_name: str, num_rows: int = 5) -> str:
+    """Get sample rows from a table to understand its data content. Use this to see what values look like before writing complex queries."""
+    logger.info(f"TOOL CALLED: get_table_sample(table='{table_name}', rows={num_rows})")
+    try:
+        dax_query = f"EVALUATE TOPN({num_rows}, '{table_name}')"
+        df = _pbi_client.execute_dax(WORKSPACE_NAME, DATASET_NAME, dax_query)
+        if df.empty:
+            return f"Table '{table_name}' is empty."
+        logger.info(f"get_table_sample returned {len(df)} rows")
+        return df.to_string(index=False)
+    except Exception as e:
+        logger.error(f"get_table_sample FAILED: {e}")
+        logger.error(traceback.format_exc())
+        return f"Error sampling table: {str(e)}"
+
+
+def search_across_tables(search_term: str) -> str:
+    """Search for a value across all text columns in all tables. Returns matching rows from any table containing the search term. Use this to find where specific names, IDs, or values exist in the model."""
+    logger.info(f"TOOL CALLED: search_across_tables(search='{search_term}')")
+    try:
+        # Get schema to find all tables and text columns
+        schema = _pbi_client.describe_dataset(WORKSPACE_NAME, DATASET_NAME)
+        results = []
+        
+        for table in schema.get("tables", []):
+            table_name = table["name"]
+            text_columns = [col["name"] for col in table.get("columns", []) 
+                          if col.get("dataType", "").lower() in ("string", "text")]
+            
+            if not text_columns:
+                continue
+            
+            # Build OR condition for all text columns
+            conditions = " || ".join([f'CONTAINSSTRING([{col}], "{search_term}")' for col in text_columns])
+            dax_query = f"EVALUATE FILTER('{table_name}', {conditions})"
+            
+            try:
+                df = _pbi_client.execute_dax(WORKSPACE_NAME, DATASET_NAME, dax_query)
+                if not df.empty:
+                    results.append(f"=== {table_name} ({len(df)} matches) ===\n{df.to_string(index=False)}")
+            except Exception as table_error:
+                logger.warning(f"Search in {table_name} failed: {table_error}")
+                continue
+        
+        if results:
+            return "\n\n".join(results)
+        else:
+            return f"No matches found for '{search_term}' in any table."
+    except Exception as e:
+        logger.error(f"search_across_tables FAILED: {e}")
+        logger.error(traceback.format_exc())
+        return f"Error searching tables: {str(e)}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,22 +177,40 @@ llm_client = AzureOpenAIChatClient(
     deployment_name=os.getenv("AZURE_OPENAI_MODEL", "gpt-4o"),
 )
 
-# Create the agent with tools
+# Create the agent with tools - schema is injected at startup
+AGENT_INSTRUCTIONS = f"""You are a Power BI analyst. Answer questions by querying the semantic model below. Be concise - give results, not explanations of your process.
+
+## DATASET SCHEMA
+
+{DATASET_SCHEMA}
+
+## RULES
+
+1. **ACT, DON'T ASK** - Never ask permission. Just query and answer.
+
+2. **USE EXACT NAMES** - Use ONLY the table/column names from the schema above. Never guess or invent names.
+
+3. **BE PERSISTENT** - If a query returns nothing, try other tables. Use search_across_tables for finding specific values. Keep going until you find the answer or exhaust all options.
+
+4. **BE BRIEF** - Report findings directly. Skip the narration about your approach.
+
+## TOOLS
+
+- get_table_sample: Preview rows from a table to understand its data
+- search_across_tables: Find a value across all text columns (use for names, IDs, etc.)
+- execute_dax: Run DAX queries
+
+## DAX SYNTAX
+
+- Use exact names from schema: EVALUATE 'Customer' or EVALUATE FILTER('Customer', [Name] = "X")
+- Text search: FILTER('Table', CONTAINSSTRING([Column], "term"))
+- Limit results: TOPN(10, 'Table')"""
+
 agent = ChatAgent(
     name="PowerBIAgent",
-    instructions="""You are a helpful Power BI analyst assistant. You can:
-1. List workspaces and datasets
-2. Describe semantic model schemas
-3. Write and execute DAX queries to answer user questions
-
-When answering questions about data:
-- First describe the dataset schema to understand the model
-- Write appropriate DAX queries
-- Present results clearly with insights
-
-Be concise and helpful.""",
+    instructions=AGENT_INSTRUCTIONS,
     chat_client=llm_client,
-    tools=[list_workspaces, list_datasets, describe_dataset, execute_dax],
+    tools=[execute_dax, get_table_sample, search_across_tables],
 )
 
 
