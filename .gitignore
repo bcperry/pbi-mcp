@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+
+node_modules/
+.tmp/
+.env
