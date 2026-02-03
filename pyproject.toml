@@ -6,16 +6,16 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "azure-identity>=1.25.1",
-    "fastmcp>=2.14.4",
+    "fastapi[standard]>=0.128.0",
     "ipykernel>=7.1.0",
     "ipywidgets>=8.1.8",
+    "agent-framework[openai]>=0.2.0",
     "pandas>=3.0.0",
-    "pythonnet>=3.0.5",
+    "python-dotenv>=1.1.0",
     "requests>=2.32.5",
-    "semantic-link>=0.13.0",
 ]
 
 [dependency-groups]
 dev = [
-    "fastapi[standard]>=0.128.0",
+    "pytest>=8.0.0",
 ]
